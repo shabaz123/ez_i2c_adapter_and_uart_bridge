@@ -1,0 +1,798 @@
+/****************************************
+ * E-Z I2C Adapter and USB-UART Bridge
+ * main.c
+ * rev 1.0 Aug 2024 shabaz
+ * rev 1.1 Nov 2024 shabaz
+ * rev 1.2 May 2026 shabaz
+ * **************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include "pico/stdlib.h"
+#include "extrafunc.h"
+#include "hardware/gpio.h"
+#include "hardware/i2c.h"
+#include "hardware/uart.h"
+#include "tusb.h"
+#include "pico/stdio.h"
+#include "pico/stdio/driver.h"
+#include "pico/bootrom.h"
+
+// definitions
+#define UART_ID uart0
+#define BAUD_RATE 9600
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+
+#define I2C_PORT_SELECTED 1
+#define I2C_SDA_PIN 14
+#define I2C_SCL_PIN 15
+#define BOARD_ADDR0_PIN 2
+#define BOARD_ADDR1_PIN 3
+#define BOARD_ADDR2_PIN 4
+#define MODE_ASCII 0
+#define MODE_BIN 1
+#define TOKEN_RESULT_ERROR 0
+#define TOKEN_RESULT_OK 1
+#define TOKEN_RESULT_LINE_COMPLETE 2
+#define M2M_RESPONSE_OK_CHAR '.'
+#define M2M_RESPONSE_CONTINUE_CHAR '&'
+#define M2M_RESPONSE_ERR_CHAR 'X'
+#define M2M_RESPONSE_PROT_ERR_CHAR '~'
+#define TOKEN_PROGRESS_NONE 0
+#define TOKEN_PROGRESS_SEND 1
+#define TOKEN_PROGRESS_RECV 2
+#define COL_RED printf("\033[31m")
+#define COL_GREEN printf("\033[32m")
+#define COL_YELLOW printf("\033[33m")
+#define COL_BLUE printf("\033[34m")
+#define COL_MAGENTA printf("\033[35m")
+#define COL_CYAN printf("\033[36m")
+#define COL_RESET printf("\033[0m")
+
+// constants
+const uint8_t EOL_BIN_MAGIC[] = {0xBA, 0xDC, 0x0F, 0xFE, 0xE0, 0x0F, 0xF0, 0x0D}; // BADC0FFEE0DDF00D
+
+// global variables
+i2c_inst_t *i2c_port;
+uint8_t board_addr;
+uint8_t uart_buffer[305];
+uint16_t uart_buffer_index = 0;
+uint8_t input_mode = MODE_ASCII;
+uint8_t m2m_resp = 0;
+uint8_t do_echo = 1;
+uint8_t i2c_addr = 0x00;
+int expected_num = 0;
+uint8_t byte_buffer[256];
+uint8_t byte_buffer_index = 0;
+uint8_t token_progress = TOKEN_PROGRESS_NONE;
+uint8_t do_repeated_start = 0;
+uint8_t led_hold_off = 0;
+uint8_t led_hold_on = 0;
+uint8_t led_counter = 0;
+uint8_t led_counter_default = 0;
+
+/************* functions ***************/
+
+void uart_bridge_init() {
+    uart_init(UART_ID, BAUD_RATE);
+
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+
+    // Keep UART RX high. It was found this was necessary when interfacing with a particular UART device, 
+    // which was a TI MSPM0 microcontroller. The issue was, that 
+    // the MSPM0 does not enable its BSL_TXD pin as an output until the MSPM0 sees activity on its BSL_RXD first,
+    // and therefore BSL_TXD is floating until then. A hardware solution would be a 22k pullup resistor on BSL_TXD,
+    // but this software solution seems to work fine as well.
+    gpio_pull_up(UART_RX_PIN);
+
+    // Optional TX drive strength increase
+    gpio_set_drive_strength(UART_TX_PIN, GPIO_DRIVE_STRENGTH_12MA);
+}
+
+void uart_bridge_task() {
+    // CDC 1 -> UART
+    while (tud_cdc_n_available(1)) {
+        uint8_t buf[64];
+        uint32_t count = tud_cdc_n_read(1, buf, sizeof(buf));
+
+        for (uint32_t i = 0; i < count; i++) {
+            while (!uart_is_writable(UART_ID)) {
+                tud_task(); // keep USB alive
+            }
+            uart_putc_raw(UART_ID, buf[i]);
+        }
+    }
+
+    // UART -> CDC 1
+    uint8_t buf[64];
+    uint32_t count = 0;
+    while (uart_is_readable(UART_ID) && count < sizeof(buf)) {
+        buf[count++] = uart_getc(UART_ID);
+    }
+    if (count) {
+        tud_cdc_n_write(1, buf, count);
+        tud_cdc_n_write_flush(1);
+    }
+}
+
+// Custom stdio driver implementation
+static void stdio_usb_out_chars(const char *buf, int len) {
+    uint32_t written = 0;
+    while (written < len) {
+        uint32_t count = tud_cdc_n_write(0, buf + written, len - written);
+        if (count == 0) {
+            tud_task(); // service USB while waiting
+        }
+        written += count;
+    }
+    tud_cdc_n_write_flush(0);
+}
+
+static int stdio_usb_in_chars(char *buf, int len) {
+    if (tud_cdc_n_available(0)) {
+        return (int)tud_cdc_n_read(0, buf, (uint32_t)len);
+    }
+    return PICO_ERROR_NO_DATA;
+}
+
+static stdio_driver_t stdio_usb_custom = {
+    .out_chars = stdio_usb_out_chars,
+    .in_chars = stdio_usb_in_chars,
+#if PICO_STDIO_ENABLE_CRLF_SUPPORT
+    .crlf_enabled = true,
+#endif
+};
+
+// Invoked when line coding of a control interface is changed
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding) {
+    if (itf == 1) {
+        uart_set_baudrate(UART_ID, p_line_coding->bit_rate);
+    } else if (itf == 0) {
+        if (p_line_coding->bit_rate == 1200) {
+            reset_usb_boot(0, 0);
+        }
+    }
+}
+
+// Invoked when line state of a control interface is changed
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
+    (void) itf; (void) dtr; (void) rts;
+}
+
+void i2c_setup(void) {
+    if (I2C_PORT_SELECTED == 0) {
+        i2c_port = &i2c0_inst;
+    } else {
+        i2c_port = &i2c1_inst;
+    }
+    i2c_init(i2c_port, 100 * 1000);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+}
+
+// returns the following addresses, depending on the state of the ADDR0 and ADDR1 pins:
+// ADDR2  ADDR1  ADDR0    Address
+// 0      0      0       0x07
+// 0      0      1       0x06
+// 0      1      0       0x05
+// 0      1      1       0x04
+// 1      0      0       0x03
+// 1      0      1       0x02
+// 1      1      0       0x01
+// 1      1      1       0x00
+uint8_t get_board_address(void) {
+    uint8_t addr = 0;
+    gpio_init(BOARD_ADDR0_PIN);
+    gpio_init(BOARD_ADDR1_PIN);
+    gpio_init(BOARD_ADDR2_PIN);
+    gpio_set_dir(BOARD_ADDR0_PIN, GPIO_IN);
+    gpio_set_dir(BOARD_ADDR1_PIN, GPIO_IN);
+    gpio_set_dir(BOARD_ADDR2_PIN, GPIO_IN);
+    gpio_pull_up(BOARD_ADDR0_PIN);
+    gpio_pull_up(BOARD_ADDR1_PIN);
+    gpio_pull_up(BOARD_ADDR2_PIN);
+    if (gpio_get(BOARD_ADDR0_PIN)) {
+        addr |= 0x01;
+    }
+    if (gpio_get(BOARD_ADDR1_PIN)) {
+        addr |= 0x02;
+    }
+    if (gpio_get(BOARD_ADDR2_PIN)) {
+        addr |= 0x04;
+    }
+    addr = 0x07 - addr;
+    return addr;
+}
+
+int check_ioport_valid(int p) {
+    int port_valid = 1;
+    if ((p < 0) || (p > 28)) {
+    port_valid = 0;
+    }
+    if ((p == BOARD_ADDR0_PIN) ||
+    (p == BOARD_ADDR1_PIN) ||
+    (p == BOARD_ADDR2_PIN) ||
+    (p == UART_TX_PIN) ||
+    (p == UART_RX_PIN) ||
+    (p == I2C_SDA_PIN) ||
+    (p == I2C_SCL_PIN)){
+        port_valid = 0;
+    }
+    return port_valid;
+}
+
+// print_buf_hex prints a buffer in hex format, up to 304 bytes
+// 000: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F : 0123456789ABCDEF
+void
+print_buf_hex(uint8_t *buf, uint16_t len) {
+    uint16_t i, j;
+    uint8_t c;
+    uint8_t index = 0;
+
+    for (i = 0; i < len; i += 16) {
+        COL_BLUE;
+        printf("%03d: ", index);
+        COL_CYAN;
+        for (j = 0; j < 16; j++) {
+            if (i + j < len) {
+                printf("%02X ", buf[i + j]);
+            } else {
+                printf("   ");
+            }
+        }
+        COL_BLUE;
+        printf(": ");
+        COL_GREEN;
+        for (j = 0; j < 16; j++) {
+            if (i + j < len) {
+                c = buf[i + j];
+                if ((c < 32) || (c > 126)) {
+                    printf(".");
+                } else {
+                    printf("%c", c);
+                }
+            } else {
+                printf(" ");
+            }
+        }
+        printf("\n");
+        index += 16;
+    }
+    COL_RESET;
+}
+
+// print the buffer as hex bytes, 16 per line, each line ending with '&'.
+// remote side should respond with '&' to continue, or 'X' to abort
+void print_buf_m2m_ascii(uint8_t *buf, uint16_t len) {
+    uint16_t i;
+    char ch;
+    for (i = 0; i < len; i++) {
+        printf("%02X ", buf[i]);
+        if ((i % 16) == 15) {
+            putchar(M2M_RESPONSE_CONTINUE_CHAR);
+            //wait for a response for up to 1 second
+            ch = getchar_timeout_us(1E6);
+            if (ch == M2M_RESPONSE_ERR_CHAR) { // PC wishes to abort
+                putchar(M2M_RESPONSE_OK_CHAR);
+                return;
+            }
+            if (ch != M2M_RESPONSE_CONTINUE_CHAR) {
+                // unexpected message, or timeout. Abort with error!
+                putchar(M2M_RESPONSE_ERR_CHAR);
+                return;
+            }
+        }
+    }
+    putchar(M2M_RESPONSE_OK_CHAR);
+}
+
+// print the buffer as raw bytes, 64 per line, each line ending with '&'.
+// remote side should respond with '&' to continue, or 'X' to abort
+void print_buf_m2m_bin(uint8_t *buf, uint16_t len) {
+    uint16_t i;
+    char ch;
+    for (i = 0; i < len; i++) {
+        putchar(buf[i]);
+        if ((i % 64) == 63) {
+            putchar(M2M_RESPONSE_CONTINUE_CHAR);
+            //wait for a response for up to 1 second
+            ch = getchar_timeout_us(1E6);
+            if (ch == M2M_RESPONSE_ERR_CHAR) { // PC wishes to abort
+                putchar(M2M_RESPONSE_OK_CHAR);
+                return;
+            }
+            if (ch != M2M_RESPONSE_CONTINUE_CHAR) {
+                // unexpected message, or timeout. Abort with error!
+                putchar(M2M_RESPONSE_ERR_CHAR);
+                return;
+            }
+        }
+    }
+    putchar(M2M_RESPONSE_OK_CHAR);
+}
+
+// used only in bitbang mode!
+void pullup_gpio(uint8_t pin) {
+    // set the pin to be an input, with pull-up enabled
+    gpio_set_dir(pin, GPIO_IN);
+    gpio_pull_up(pin);
+}
+// used only in bitbang mode!
+void pulldown_gpio(uint8_t pin) {
+    // set the pin to be an output, set low
+    gpio_set_dir(pin, GPIO_OUT);
+    gpio_put(pin, 0);
+}
+// this function will switch into GPIO mode and bitbang the I2C address to see if the ACK is received
+// then it switches back to I2C mode
+// returns 1 if ACK received, 0 otherwise
+int bitbang_i2c_addr(unsigned int val) {
+    uint8_t ack;
+    uint8_t i;
+    uint8_t addr = (uint8_t) val;
+    gpio_init(I2C_SDA_PIN);
+    gpio_init(I2C_SCL_PIN);
+    pullup_gpio(I2C_SDA_PIN);
+    pullup_gpio(I2C_SCL_PIN);
+    // perform the I2C start condition
+    pulldown_gpio(I2C_SDA_PIN);
+    sleep_us(5);
+    pulldown_gpio(I2C_SCL_PIN);
+    sleep_us(5);
+    addr <<= 1; // left-shift the address by 1 bit
+    addr |= 1; // we want to do an I2C read
+    // send the address
+    for (i=0; i<8; i++) {
+        if (addr & 0x80) {
+            pullup_gpio(I2C_SDA_PIN);
+        } else {
+            pulldown_gpio(I2C_SDA_PIN);
+        }
+        sleep_us(5);
+        pullup_gpio(I2C_SCL_PIN);
+        sleep_us(5);
+        pulldown_gpio(I2C_SCL_PIN);
+        sleep_us(5);
+        addr <<= 1;
+    }
+    // now read the ACK bit
+    pullup_gpio(I2C_SDA_PIN);
+    sleep_us(5);
+    pullup_gpio(I2C_SCL_PIN);
+    sleep_us(5);
+    ack = gpio_get(I2C_SDA_PIN);
+    pulldown_gpio(I2C_SCL_PIN);
+    sleep_us(5);
+    // now release the I2C bus
+    pullup_gpio(I2C_SCL_PIN);
+    sleep_us(5);
+    pullup_gpio(I2C_SDA_PIN);
+    sleep_us(5);
+    // convert back to I2C mode
+    i2c_init(i2c_port, 100 * 1000);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+    if (ack==0) { // held low means the device is present
+        return 1;
+        } else {
+        return 0;
+    }
+}
+
+// scan_uart_input fill the uart_buffer until a newline is received
+// returns number of bytes if a newline is received, 0 otherwise
+int
+scan_uart_input(void) {
+    int c;
+    uint16_t num_bytes;
+    c = getchar_timeout_us(1000);
+    if (c == PICO_ERROR_TIMEOUT) {
+        return 0;
+    }
+    // ASCII mode
+    if (input_mode == MODE_ASCII) {
+        if ((c == 8) || (c==127)) { // backspace pressed
+            if (uart_buffer_index > 0) {
+                uart_buffer_index--;
+                if (do_echo) {
+                    putchar(8);
+                    putchar(' ');
+                    putchar(8);
+                }
+            }
+            return 0;
+        }
+        if (c == 13) {
+            // add a space to simplify token parsing
+            uart_buffer[uart_buffer_index++] = ' ';
+            uart_buffer[uart_buffer_index] = 0;
+            num_bytes = uart_buffer_index;
+            uart_buffer_index = 0;
+            if (m2m_resp) {
+                // don't send anything
+            } else {
+                if (do_echo) {
+                    printf("\n");
+                }
+            }
+            return num_bytes;
+        }
+        uart_buffer[uart_buffer_index] = (uint8_t) c;
+        if (do_echo) {
+            if (m2m_resp) {
+                // don't echo
+            } else {
+                putchar(c);
+            }
+        }
+        uart_buffer_index++;
+        if (uart_buffer_index >= 300) {
+            uart_buffer_index = 0;
+        }
+        return 0;
+    }
+    // binary mode
+    // we keep reading bytes until we find the magic number
+    uart_buffer[uart_buffer_index] = (uint8_t) c;
+    uart_buffer_index++;
+    if (uart_buffer_index < 8) {
+        return 0;
+    }
+    if (memcmp(&uart_buffer[uart_buffer_index-8], EOL_BIN_MAGIC, 8) == 0) {
+        num_bytes = uart_buffer_index - 8;
+        uart_buffer_index = 0;
+        print_buf_hex(uart_buffer, num_bytes);
+        return num_bytes;
+    }
+    return(0);
+}
+
+int decode_token(char *token) {
+    unsigned int val;
+    int ioport, ioval; // used for the iowrite and ioread commands
+    int port_valid;
+    int retval = 0;
+    if (strcmp(token, "device?") == 0) {
+        printf("easy_adapter_%d\n\r", board_addr);
+        led_hold_off = 1;
+        // reset any state and variables
+        token_progress = TOKEN_PROGRESS_NONE;
+        expected_num = 0;
+        byte_buffer_index = 0;
+        do_repeated_start = 0;
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strcmp(token, "bin") == 0) {
+        input_mode = MODE_BIN;
+        if(m2m_resp) {
+            putchar(M2M_RESPONSE_OK_CHAR);
+        } else {
+            printf("Switching to binary mode\n");
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strncmp(token, "bytes:", 6) == 0) {
+        sscanf(token, "bytes:%d", &expected_num);
+        if(m2m_resp) {
+            putchar(M2M_RESPONSE_OK_CHAR);
+        } else {
+            COL_BLUE;
+            printf("Expecting %d bytes\n", expected_num);
+            COL_RESET;
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strcmp(token, "send+hold") == 0) { // perform send, but hold the bus for a later repeated start
+        if (expected_num == 0) {
+            COL_RED;
+            printf("No bytes expected\n");
+            COL_RESET;
+            return TOKEN_RESULT_LINE_COMPLETE;
+        }
+        // consider remainder tokens on the line to be bytes for the send operation
+        byte_buffer_index = 0;
+        token_progress = TOKEN_PROGRESS_SEND;
+        do_repeated_start = 1;
+        return TOKEN_RESULT_OK;
+    }
+    if (strncmp(token, "tryaddr:", 8) == 0) {
+        if (strncmp(token, "tryaddr:0x", 10) == 0) {
+            // get i2c_addr in hex
+            sscanf(token, "tryaddr:0x%02X", &val);
+        } else {
+            // get i2c_addr in decimal
+            sscanf(token, "tryaddr:%d", &val);
+        }
+        retval = bitbang_i2c_addr(val);
+        if(m2m_resp) {
+            if (input_mode == MODE_ASCII) {
+                if (retval == 0) {
+                    putchar(M2M_RESPONSE_PROT_ERR_CHAR);
+                } else {
+                    putchar(M2M_RESPONSE_OK_CHAR);
+                }
+            } else {
+                // binary mode, todo
+            }
+        } else {
+            if (retval == 0) {
+                COL_RED;
+                printf("Protocol error! Does the I2C device exist?\n");
+                COL_RESET;
+            } else {
+                COL_BLUE;
+                printf("Device found at address 0x%02X\n", val);
+                COL_RESET;
+            }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strncmp(token, "iowrite:", 8) == 0) {
+        sscanf(token, "iowrite:%d,%d", &ioport, &ioval);
+        port_valid = check_ioport_valid(ioport);
+        if (port_valid && ((ioval == 0) || (ioval == 1))) {
+            gpio_init(ioport);
+            gpio_set_dir(ioport, GPIO_OUT);
+            gpio_put(ioport, ioval);
+            if(m2m_resp) {
+                putchar(M2M_RESPONSE_OK_CHAR);
+            } else {
+                COL_BLUE;
+                printf("Port %d set to output %d\n", ioport, ioval);
+                COL_RESET;
+            }
+        } else {
+            if(m2m_resp) {
+                putchar(M2M_RESPONSE_ERR_CHAR);
+            } else {
+                COL_RED;
+                printf("Error, invalid IO port or value\n");
+                COL_RESET;
+            }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strncmp(token, "ioread:", 7) == 0) {
+        sscanf(token, "ioread:%d", &ioport);
+        port_valid = check_ioport_valid(ioport);
+        if (port_valid) {
+            gpio_init(ioport);
+            gpio_set_dir(ioport, GPIO_IN);
+            gpio_pull_up(ioport); // avoid floating input, so enable pull-up
+            ioval = gpio_get(ioport);
+            if(m2m_resp) {
+                if (ioval) {
+                    putchar('1');
+                } else {
+                    putchar('0');
+                }
+                putchar(M2M_RESPONSE_OK_CHAR);
+            } else {
+                COL_BLUE;
+                printf("Port %d read input as %d\n", ioport, ioval);
+                COL_RESET;
+            }
+        } else {
+            if(m2m_resp) {
+                putchar(M2M_RESPONSE_ERR_CHAR);
+            } else {
+                COL_RED;
+                printf("Error, invalid IO port\n");
+                COL_RESET;
+            }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strcmp(token, "send") == 0) {
+        if (expected_num == 0) {
+            COL_RED;
+            printf("No bytes expected\n");
+            COL_RESET;
+            return TOKEN_RESULT_LINE_COMPLETE;
+        }
+        // consider remainder tokens on the line to be bytes for the send operation
+        byte_buffer_index = 0;
+        token_progress = TOKEN_PROGRESS_SEND;
+        do_repeated_start = 0;
+        return TOKEN_RESULT_OK;
+    }
+    if (strcmp(token, "recv") == 0) {
+        if (expected_num == 0) {
+            COL_RED;
+            printf("No bytes expected\n");
+            COL_RESET;
+            return TOKEN_RESULT_LINE_COMPLETE;
+        }
+        byte_buffer_index = 0;
+        retval = i2c_read_blocking(i2c_port, i2c_addr, byte_buffer, expected_num, false);
+        if(m2m_resp) {
+            if (input_mode == MODE_ASCII) {
+                if (retval == PICO_ERROR_GENERIC) {
+                    putchar(M2M_RESPONSE_PROT_ERR_CHAR);
+                } else {
+                    print_buf_m2m_ascii(byte_buffer, expected_num);
+                }
+            } else {
+                print_buf_m2m_bin(byte_buffer, expected_num);
+            }
+        } else {
+            if (retval == PICO_ERROR_GENERIC) {
+                COL_RED;
+                printf("Protocol error reading bytes! Does the I2C device exist?\n");
+                COL_RESET;
+            } else {
+                print_buf_hex(byte_buffer, expected_num);
+            }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strncmp(token, "m2m_resp:", 9) == 0) {
+        if (token[9] == '1') {
+            m2m_resp = 1;
+            putchar(M2M_RESPONSE_OK_CHAR);
+        } else {
+            m2m_resp = 0;
+            printf("M2M response off\n");
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strncmp(token, "addr:0x", 7) == 0) {
+        // get i2c_addr
+        sscanf(token, "addr:0x%02X", &val);
+        i2c_addr = val;
+        if(m2m_resp) {
+            putchar(M2M_RESPONSE_OK_CHAR);
+        } else {
+            COL_BLUE;
+            printf("I2C address set to 0x%02X\n", i2c_addr);
+            COL_RESET;
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    } else if (strncmp(token, "addr:", 5) == 0) {
+        // get i2c_addr in decimal
+        sscanf(token, "addr:%d", &val);
+        i2c_addr = val;
+        if(m2m_resp) {
+            putchar(M2M_RESPONSE_OK_CHAR);
+        } else {
+            COL_BLUE;
+            printf("I2C address set to 0x%02X\n", i2c_addr);
+            COL_RESET;
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (strcmp(token, "noecho") == 0) {
+        do_echo = 0;
+        COL_BLUE;
+        printf("Echo off\n");
+        COL_RESET;
+        return 0;
+    }
+    if (strcmp(token, "end_tok") == 0) {
+        if (token_progress == TOKEN_PROGRESS_SEND) {
+            // we are still expecting more bytes, on the next line
+            if (m2m_resp) {
+                putchar(M2M_RESPONSE_CONTINUE_CHAR);
+            } else {
+                COL_BLUE;
+                printf("Remaining bytes expected: %d\n", expected_num - byte_buffer_index);
+                COL_RESET;
+            }
+        }
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+    if (token_progress == TOKEN_PROGRESS_SEND) {
+        if (strlen(token) != 2) {
+            COL_RED;
+            printf("Invalid byte: %s\n", token);
+            COL_RESET;
+            return TOKEN_RESULT_LINE_COMPLETE;
+        }
+        sscanf(token, "%02X", &val);
+        byte_buffer[byte_buffer_index] = val;
+        byte_buffer_index++;
+        if (byte_buffer_index == expected_num) {
+            // send the bytes
+            if (m2m_resp==0) {
+                COL_BLUE;
+                printf("Sending %d bytes\n", expected_num);
+                COL_RESET;
+                print_buf_hex(byte_buffer, expected_num);
+            }
+            if (do_repeated_start) {
+                retval = i2c_write_blocking(i2c_port, i2c_addr, byte_buffer, expected_num, true);
+            } else {
+                retval = i2c_write_blocking(i2c_port, i2c_addr, byte_buffer, expected_num, false);
+            }
+            byte_buffer_index = 0;
+            expected_num = 0;
+            do_repeated_start = 0;
+            token_progress = TOKEN_PROGRESS_NONE;
+            if (retval == PICO_ERROR_GENERIC) {
+                if (m2m_resp) {
+                    putchar(M2M_RESPONSE_PROT_ERR_CHAR);
+                } else {
+                    COL_RED;
+                    printf("Protocol error sending bytes! Does the I2C device exist?\n");
+                    COL_RESET;
+                }
+                return TOKEN_RESULT_LINE_COMPLETE;
+            }
+            if (m2m_resp) {
+                putchar(M2M_RESPONSE_OK_CHAR);
+            }
+            return TOKEN_RESULT_LINE_COMPLETE;
+        }
+        return TOKEN_RESULT_OK; // continue reading tokens on the send line
+    }
+    // done
+    if (m2m_resp) {
+        putchar(M2M_RESPONSE_ERR_CHAR);
+        return TOKEN_RESULT_LINE_COMPLETE;
+    } else {
+        COL_RED;
+        printf("Unknown command: %s\n", token);
+        COL_RESET;
+        return TOKEN_RESULT_LINE_COMPLETE;
+    }
+}
+
+// if in ASCII mode, parse each space-separated token
+int process_line(uint8_t *buf, uint16_t len) {
+    int res;
+    char token[20];
+    uint16_t i = 0;
+    uint16_t j = 0;
+    if (len == 0) {
+        return TOKEN_RESULT_ERROR;
+    }
+    while (i < len) {
+        if (buf[i] == ' ') {
+            token[j] = 0;
+            //printf("token: %s\n", token);
+            res = decode_token(token);
+            if (res == TOKEN_RESULT_LINE_COMPLETE) {
+                return TOKEN_RESULT_LINE_COMPLETE;
+            }
+            j = 0;
+        } else {
+            token[j] = buf[i];
+            j++;
+        }
+        i++;
+    }
+    res = decode_token("end_tok");
+}
+
+int
+main(void)
+{
+    int numbytes;
+    // stdio_init_all(); // We will use our custom stdio driver
+    tusb_init();
+    stdio_set_driver_enabled(&stdio_usb_custom, true);
+    
+    sleep_ms(100);
+    board_addr = get_board_address();
+    sleep_ms(3000);
+    led_setup(); // initialize LED pin to be an output
+    i2c_setup(); // configures the I2C pins accordingly
+    uart_bridge_init(); // initialize the USB-UART bridge
+
+    led_ctrl(1);  // turn on the LED to indicate operation
+    while (1) {
+        tud_task(); // TinyUSB device task
+        uart_bridge_task(); // handle USB-UART bridge data
+
+        numbytes = scan_uart_input(); // handle UART input for the I2C adapter commands
+        if (numbytes > 0) {
+            process_line(uart_buffer, numbytes); // process UART commands for the I2C adapter
+        }
+    }
+}

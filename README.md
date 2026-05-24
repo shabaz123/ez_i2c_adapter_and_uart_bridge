@@ -3,8 +3,8 @@
 This project transforms a Raspberry Pi Pico into a multi-function hardware debugging tool. It provides a concurrent **I2C Master** and a **USB-to-UART Bridge** over a single USB connection, allowing you to control and monitor hardware directly from your PC.
 
 The device enumerates as two separate COM ports:
-1.  **Port 1 (CDC 0):** EZ-I2C Adapter (Command Interface/Pico Stdio)
-2.  **Port 2 (CDC 1):** EZ-UART Bridge (Transparent Serial Bridge)
+1.  **First Port (CDC 0):** EZ-I2C Adapter
+2.  **Second Port (CDC 1):** EZ-UART Bridge
 
 ---
 
@@ -12,8 +12,8 @@ The device enumerates as two separate COM ports:
 
 | Function | Pi Pico Pin | GPIO | Notes |
 | :--- | :--- | :--- | :--- |
-| **I2C SDA** | Pin 19 | GPIO 14 | Requires external pull-up to 3.3V |
-| **I2C SCL** | Pin 20 | GPIO 15 | Requires external pull-up to 3.3V |
+| **I2C SDA** | Pin 19 | GPIO 14 | Requires external pull-up (e.g. 6.8k) to 3.3V |
+| **I2C SCL** | Pin 20 | GPIO 15 | Requires external pull-up (e.g. 6.8k) to 3.3V |
 | **UART TX** | Pin 1 | GPIO 0 | Pico Transmit / Target Receive |
 | **UART RX** | Pin 2 | GPIO 1 | Pico Receive / Target Transmit |
 | **Ground** | Pin 3, 8, etc. | GND | Common Ground |
@@ -34,6 +34,7 @@ addr:0x0b
 bytes:1
 send AA
 ```
+For more examples, refer to the [original project](https://github.com/shabaz123/easy_pico_adapter).
 
 ### Python API
 You can use the existing `easyadapter.py` library from the [original project](https://github.com/shabaz123/easy_pico_adapter). Simply point the library to the COM port associated with the "EZ-I2C Adapter".
@@ -42,10 +43,9 @@ You can use the existing `easyadapter.py` library from the [original project](ht
 
 ## 2. USB-UART Bridge Function
 
-Connect to the **second COM port** (Port 2). This port acts as a transparent bridge to the hardware UART on GPIO 0/1.
+Connect to the second COM port. This port acts as a transparent bridge to the hardware UART on GPIO 0/1.
 
 - **Dynamic Baud Rate:** The hardware UART baud rate automatically updates when you change the settings in your PC terminal software (e.g., PuTTY, Tera Term).
-- **MSP Support:** Includes a software pull-up on RX to handle targets with floating pins (like the TI MSPM0).
 
 ---
 
@@ -57,7 +57,9 @@ A build script is provided for Windows users using the ARM GNU Toolchain and Nin
 2.  Run `build.bat`.
 3.  Flash the resulting `build/ez_i2c_adapter_and_uart_bridge.uf2` to your Pico.
 
+It is possible to build the code on Linux, Mac, and using VS Code and other IDEs, but you may need to make slight tweaks to CMakeLists.txt.
+
 ---
 
 ## Credits
-Based on [easy_pico_adapter](https://github.com/shabaz123/easy_pico_adapter) by shabaz.
+Based on [easy_pico_adapter](https://github.com/shabaz123/easy_pico_adapter)

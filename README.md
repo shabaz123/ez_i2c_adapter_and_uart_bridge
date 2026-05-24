@@ -1,4 +1,4 @@
-# EZ I2C Adapter & USB-UART Bridge
+# E-Z I2C Adapter & USB-UART Bridge
 
 This project transforms a Raspberry Pi Pico into a multi-function hardware debugging tool. It provides a concurrent **I2C Master** and a **USB-to-UART Bridge** over a single USB connection, allowing you to control and monitor hardware directly from your PC.
 
